@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from . import db
 from .auth import require
 from .errors import ApiError
+from .pop import consume_proof
 from .util import b64url_decode_unpadded
 
 router = APIRouter(tags=["keys"])
@@ -91,6 +92,14 @@ async def register_key(
                     " VALUES ($1, $2, $3, $4)",
                     tenant_id, body.keyId, role, public_key,
                 )
+                if role == "current":
+                    # A tenant with a first key starts at key generation 0;
+                    # every successful promote advances it.
+                    await conn.execute(
+                        "INSERT INTO tenant_state (tenant_id, key_generation)"
+                        " VALUES ($1, 0) ON CONFLICT (tenant_id) DO NOTHING",
+                        tenant_id,
+                    )
                 roles[role] = body.keyId
                 return {"tenantId": tenant_id, "keyId": body.keyId, "role": role, "roles": roles}
     except asyncpg.UniqueViolationError:
@@ -103,7 +112,12 @@ async def register_key(
 
 @router.post("/tenants/{tenant_id}/keys/promote")
 async def promote_key(tenant_id: str, _: None = Depends(require("keys:manage"))):
-    """Atomically: candidate -> current, old current -> retiring."""
+    """Atomically: candidate -> current, old current -> retiring.
+
+    Tenants with the pre-promotion proof-of-possession policy enabled must
+    hold a valid, unconsumed proof for the current candidate; the proof is
+    consumed within this same transaction, immediately before the role swap.
+    """
     _check_ids(tenant_id)
     async with db.pool.acquire() as conn:
         async with conn.transaction():
@@ -111,6 +125,12 @@ async def promote_key(tenant_id: str, _: None = Depends(require("keys:manage")))
             roles, _ = await _fetch_roles(conn, tenant_id)
             if roles["candidate"] is None or roles["retiring"] is not None:
                 raise ApiError(409, "ILLEGAL_TRANSITION", roles=roles)
+
+            # Raises with authoritative roles and a precise code when the
+            # tenant requires a proof that is missing/expired/consumed/stale;
+            # on success the proof is consumed by this transaction.
+            await consume_proof(conn, tenant_id, roles)
+
             # Order matters: the partial unique indexes admit only one row per
             # role, so the old current must move out first.
             await conn.execute(
@@ -123,10 +143,19 @@ async def promote_key(tenant_id: str, _: None = Depends(require("keys:manage")))
                 " WHERE tenant_id = $1 AND role = 'candidate'",
                 tenant_id,
             )
+            generation = await conn.fetchval(
+                "UPDATE tenant_state SET key_generation = key_generation + 1"
+                " WHERE tenant_id = $1 RETURNING key_generation",
+                tenant_id,
+            )
             roles["retiring"] = roles["current"]
             roles["current"] = roles["candidate"]
             roles["candidate"] = None
-            return {"tenantId": tenant_id, "roles": roles}
+            return {
+                "tenantId": tenant_id,
+                "roles": roles,
+                "keyGeneration": generation,
+            }
 
 
 @router.post("/tenants/{tenant_id}/keys/retire")

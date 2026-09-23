@@ -15,15 +15,21 @@ _TOKEN_SCOPES = {
 }
 
 
+def validate_token(token: str | None) -> frozenset[str]:
+    """Return the scopes for a token, or raise 401 when it is missing/unknown."""
+    if token is None:
+        raise ApiError(401, "UNAUTHORIZED", headers={"WWW-Authenticate": "Bearer"})
+    scopes = _TOKEN_SCOPES.get(token)
+    if scopes is None:
+        raise ApiError(401, "UNAUTHORIZED", headers={"WWW-Authenticate": "Bearer"})
+    return scopes
+
+
 def require(scope: str):
     async def dependency(
         credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
     ) -> None:
-        if credentials is None:
-            raise ApiError(401, "UNAUTHORIZED", headers={"WWW-Authenticate": "Bearer"})
-        scopes = _TOKEN_SCOPES.get(credentials.credentials)
-        if scopes is None:
-            raise ApiError(401, "UNAUTHORIZED", headers={"WWW-Authenticate": "Bearer"})
+        scopes = validate_token(credentials.credentials if credentials else None)
         if scope not in scopes:
             raise ApiError(403, "FORBIDDEN")
 

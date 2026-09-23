@@ -3,7 +3,7 @@ import asyncio
 
 import asyncpg
 
-from .config import DATABASE_URL
+from .config import DATABASE_URL, DEFAULT_POP_CHALLENGE_TTL_SECONDS
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tenant_keys (
@@ -34,7 +34,66 @@ CREATE TABLE IF NOT EXISTS receipts (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS receipts_by_tenant ON receipts (tenant_id, created_at);
+
+-- Per-tenant key generation. Only present once a tenant gains a key; the
+-- generation advances whenever the current key changes, binding a
+-- proof-of-possession to the exact current/candidate pair it was made for.
+CREATE TABLE IF NOT EXISTS tenant_state (
+    tenant_id        TEXT PRIMARY KEY,
+    key_generation   BIGINT NOT NULL DEFAULT 0
+);
+
+-- Tenant-level, opt-in pre-promotion proof-of-possession policy. Absence of a
+-- row means the legacy behaviour: register/promote/verify stay unchanged.
+CREATE TABLE IF NOT EXISTS tenant_policies (
+    tenant_id        TEXT PRIMARY KEY,
+    pop_required     BOOLEAN NOT NULL DEFAULT FALSE,
+    challenge_ttl    INTEGER NOT NULL CHECK (challenge_ttl BETWEEN 1 AND 86400),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One-time challenges / proofs. Each row moves
+--   issued -> answered -> consumed (by the single successful promote)
+-- and may be short-circuited to 'expired'. Only 'answered' rows whose context
+-- still matches can drive a promotion.
+CREATE TABLE IF NOT EXISTS pop_challenges (
+    challenge_id        UUID        PRIMARY KEY,
+    tenant_id           TEXT        NOT NULL,
+    candidate_key_id    TEXT        NOT NULL,
+    current_key_id      TEXT        NOT NULL,
+    current_generation  BIGINT      NOT NULL,
+    nonce               BYTEA       NOT NULL,
+    status              TEXT        NOT NULL CHECK (status IN
+                            ('issued', 'answered', 'consumed', 'expired')),
+    ttl_seconds         INTEGER     NOT NULL CHECK (ttl_seconds BETWEEN 1 AND 86400),
+    issued_at           TIMESTAMPTZ NOT NULL,
+    expires_at          TIMESTAMPTZ NOT NULL,
+    answered_at         TIMESTAMPTZ,
+    consumed_at         TIMESTAMPTZ,
+    FOREIGN KEY (tenant_id, candidate_key_id)
+        REFERENCES tenant_keys (tenant_id, key_id),
+    FOREIGN KEY (tenant_id, current_key_id)
+        REFERENCES tenant_keys (tenant_id, key_id)
+);
+-- Backstop: at most one live (issued/answered) challenge per tenant+candidate.
+CREATE UNIQUE INDEX IF NOT EXISTS pop_challenges_one_open
+    ON pop_challenges (tenant_id, candidate_key_id)
+    WHERE status IN ('issued', 'answered');
+
+-- Shared virtual clock: now() plus one offset row. Every API instance reads
+-- the same virtual time, so acceptance runs can advance expiry deterministically.
+CREATE TABLE IF NOT EXISTS service_clock (
+    id         INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    offset_sec BIGINT NOT NULL DEFAULT 0
+);
+INSERT INTO service_clock (id, offset_sec)
+VALUES (1, 0) ON CONFLICT (id) DO NOTHING;
 """
+
+# Virtual now() used for every challenge/proof timing decision. STABLE within
+# the transaction and identical on every API instance because the offset lives
+# in the database.
+VIRTUAL_NOW_SQL = "(now() + (SELECT offset_sec * interval '1 second' FROM service_clock WHERE id = 1))"
 
 pool: asyncpg.Pool | None = None
 
@@ -64,3 +123,7 @@ async def close() -> None:
     if pool is not None:
         await pool.close()
         pool = None
+
+
+def default_challenge_ttl() -> int:
+    return DEFAULT_POP_CHALLENGE_TTL_SECONDS
