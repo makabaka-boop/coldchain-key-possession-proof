@@ -23,9 +23,36 @@ services:
       DATABASE_URL: postgresql://coldchain:coldchain@db:5432/coldchain
       ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
       GATEWAY_TOKEN: ${GATEWAY_TOKEN:-dev-gateway-token}
+      # Challenge lifetime; can be overridden, verify uses a short TTL on purpose.
+      CHALLENGE_TTL_SECONDS: ${CHALLENGE_TTL_SECONDS:-300}
+      # Test-only deterministic clock control. Defaults to off; the bundled
+      # verify stack enables it to cover expiry. Never enable in production.
+      ENABLE_CLOCK_CONTROL: ${ENABLE_CLOCK_CONTROL:-0}
     ports:
       # 宿主机端口只能由 API_PORT 给出；未设置时 compose 直接报错，不占用任何默认端口。
       - "${API_PORT:?API_PORT must be set, e.g. 'API_PORT=8080 docker compose up'}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  # Second, independently deployed stateless instance over the same database.
+  # Not published on the host; used by verify to cover cross-instance clock,
+  # challenge and concurrency behavior.
+  api2:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://coldchain:coldchain@db:5432/coldchain
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
+      GATEWAY_TOKEN: ${GATEWAY_TOKEN:-dev-gateway-token}
+      CHALLENGE_TTL_SECONDS: ${CHALLENGE_TTL_SECONDS:-300}
+      ENABLE_CLOCK_CONTROL: ${ENABLE_CLOCK_CONTROL:-0}
     depends_on:
       db:
         condition: service_healthy
@@ -41,10 +68,17 @@ services:
     command: ["python", "-m", "pytest", "tests/", "-v", "--tb=short"]
     environment:
       API_BASE_URL: http://api:8000
+      API_BASE2_URL: http://api2:8000
       ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token}
       GATEWAY_TOKEN: ${GATEWAY_TOKEN:-dev-gateway-token}
+      # Short challenge lifetime and the controllable clock let verify cover
+      # expiry deterministically without sleeping.
+      CHALLENGE_TTL_SECONDS: 30
+      ENABLE_CLOCK_CONTROL: "1"
     depends_on:
       api:
+        condition: service_healthy
+      api2:
         condition: service_healthy
 
 volumes:

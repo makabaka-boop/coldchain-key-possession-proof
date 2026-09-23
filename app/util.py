@@ -1,8 +1,12 @@
-"""Strict unpadded base64url decoding."""
+"""Strict unpadded base64url decoding/encoding."""
 import base64
 import binascii
 
 from .errors import ApiError
+
+
+def b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
 def b64url_decode_unpadded(value: str, *, error_code: str) -> bytes:

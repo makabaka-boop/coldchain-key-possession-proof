@@ -8,6 +8,9 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 BASE_URL = os.environ.get("API_BASE_URL", "http://localhost:8000").rstrip("/")
+# A second, independently deployed API instance sharing the same database;
+# cross-instance behavior (clock, challenges, races) is exercised against it.
+BASE2_URL = os.environ.get("API_BASE2_URL", BASE_URL).rstrip("/")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "dev-admin-token")
 GATEWAY_TOKEN = os.environ.get("GATEWAY_TOKEN", "dev-gateway-token")
 
@@ -16,7 +19,11 @@ GATEWAY_HEADERS = {"Authorization": f"Bearer {GATEWAY_TOKEN}"}
 
 
 def b64url(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def b64url_decode(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
 
 
 class TenantKey:
@@ -30,6 +37,28 @@ class TenantKey:
     def sign(self, body: bytes) -> str:
         return b64url(self._private.sign(body))
 
+    def sign_raw(self, body: bytes) -> bytes:
+        return self._private.sign(body)
+
+
+# Canonical proof-of-possession envelope; must match app/pop.py exactly.
+POP_CONTEXT = b"coldchain-gateway:v1:promotion-proof-of-possession"
+
+
+def pop_message(tenant_id: str, key_id: str, generation: int,
+                challenge: bytes, expires_at: str) -> bytes:
+    def frame(tag: bytes, data: bytes) -> bytes:
+        return tag + b"=" + str(len(data)).encode("ascii") + b":" + data
+
+    return b"|".join([
+        b"context=" + str(len(POP_CONTEXT)).encode("ascii") + b":" + POP_CONTEXT,
+        frame(b"tenant", tenant_id.encode("utf-8")),
+        frame(b"candidate", key_id.encode("utf-8")),
+        frame(b"generation", str(generation).encode("ascii")),
+        frame(b"challenge", challenge),
+        frame(b"expires", expires_at.encode("ascii")),
+    ])
+
 
 @pytest.fixture()
 def admin_client():
@@ -38,8 +67,20 @@ def admin_client():
 
 
 @pytest.fixture()
+def admin_client2():
+    with httpx.Client(base_url=BASE2_URL, headers=ADMIN_HEADERS, timeout=30.0) as client:
+        yield client
+
+
+@pytest.fixture()
 def gateway_client():
     with httpx.Client(base_url=BASE_URL, headers=GATEWAY_HEADERS, timeout=30.0) as client:
+        yield client
+
+
+@pytest.fixture()
+def gateway_client2():
+    with httpx.Client(base_url=BASE2_URL, headers=GATEWAY_HEADERS, timeout=30.0) as client:
         yield client
 
 
@@ -87,3 +128,54 @@ def submit(client, tenant_id, key_id, signature, body):
             "X-Signature": signature,
         },
     )
+
+
+# --- proof-of-possession helpers ------------------------------------------
+
+def set_policy(client, tenant_id, enabled: bool):
+    return client.put(
+        f"/v1/tenants/{tenant_id}/policy",
+        json={"requirePromotionProof": enabled},
+    )
+
+
+def request_challenge(client, tenant_id):
+    return client.post(f"/v1/tenants/{tenant_id}/proof/challenge")
+
+
+def answer_challenge(client, tenant_id, challenge, key: TenantKey):
+    message = pop_message(
+        tenant_id, key.key_id, challenge["currentGeneration"],
+        b64url_decode(challenge["challenge"]), challenge["expiresAt"],
+    )
+    return client.post(
+        f"/v1/tenants/{tenant_id}/proof/challenge/{challenge['challengeId']}/answer",
+        json={"signature": key.sign(message)},
+    )
+
+
+def advance_clock(client, seconds: int):
+    return client.post("/v1/internal/clock/advance", json={"seconds": seconds})
+
+
+def reset_clock(client):
+    return client.post("/v1/internal/clock/reset")
+
+
+@pytest.fixture(autouse=True)
+def _reset_service_clock():
+    """The deterministic clock is global state; keep each test independent.
+
+    No-op on deployments without the test-only clock endpoint.
+    """
+    with httpx.Client(base_url=BASE_URL, headers=ADMIN_HEADERS, timeout=10.0) as client:
+        try:
+            client.post("/v1/internal/clock/reset")
+        except httpx.HTTPError:
+            pass
+    yield
+    with httpx.Client(base_url=BASE_URL, headers=ADMIN_HEADERS, timeout=10.0) as client:
+        try:
+            client.post("/v1/internal/clock/reset")
+        except httpx.HTTPError:
+            pass
